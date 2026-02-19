@@ -51,7 +51,7 @@ from music_assistant.constants import (
 )
 from music_assistant.helpers.api import api_command
 from music_assistant.helpers.compare import compare_strings
-from music_assistant.helpers.images import create_collage, get_image_thumb
+from music_assistant.helpers.images import cleanup_thumb_cache, create_collage, get_image_thumb
 from music_assistant.helpers.security import is_safe_path
 from music_assistant.helpers.throttle_retry import Throttler
 from music_assistant.models.core_controller import CoreController
@@ -113,6 +113,9 @@ REFRESH_INTERVAL_PODCASTS = 60 * 60 * 24 * 90  # 90 days
 REFRESH_INTERVAL_PLAYLISTS = 60 * 60 * 24 * 14  # 14 days
 PERIODIC_SCAN_INTERVAL = 60 * 60 * 6  # 6 hours
 CONF_ENABLE_ONLINE_METADATA = "enable_online_metadata"
+CONF_THUMB_CACHE_MAX_SIZE = "thumb_cache_max_size"
+DEFAULT_THUMB_CACHE_MAX_SIZE_MB = 500
+THUMB_CACHE_CLEANUP_INTERVAL = 60 * 60 * 24  # 24 hours
 
 
 class MetaDataController(CoreController):
@@ -170,6 +173,18 @@ class MetaDataController(CoreController):
                 "in the background to not overload these free services with requests. "
                 "You can speedup the process by storing the images and other metadata locally.",
             ),
+            ConfigEntry(
+                key=CONF_THUMB_CACHE_MAX_SIZE,
+                type=ConfigEntryType.INTEGER,
+                label="Maximum thumbnail cache size (MB)",
+                required=False,
+                default_value=DEFAULT_THUMB_CACHE_MAX_SIZE_MB,
+                range=(50, 5000),
+                description="Maximum total size in megabytes for the on-disk thumbnail cache.\n\n"
+                "Thumbnails are generated from album art and other images to avoid "
+                "repeated processing (e.g. ffmpeg extractions for embedded cover art). "
+                "Oldest thumbnails are automatically removed when this limit is exceeded.",
+            ),
         )
 
     async def setup(self, config: CoreConfig) -> None:
@@ -183,6 +198,8 @@ class MetaDataController(CoreController):
         if not await asyncio.to_thread(os.path.exists, self._collage_images_dir):
             await asyncio.to_thread(os.mkdir, self._collage_images_dir)
         self.mass.streams.register_dynamic_route("/imageproxy", self.handle_imageproxy)
+        # schedule periodic thumbnail cache cleanup
+        self.mass.call_later(60, self._cleanup_thumb_cache)
         # the lookup task is used to process metadata lookup jobs
         self._lookup_task = self.mass.create_task(self._process_metadata_lookup_jobs())
         # just run the scan for missing metadata once at startup
@@ -975,6 +992,16 @@ class MetaDataController(CoreController):
                     str(err),
                     exc_info=err if self.logger.isEnabledFor(10) else None,
                 )
+
+    async def _cleanup_thumb_cache(self) -> None:
+        """Remove oldest thumbnails when the cache folder exceeds the configured limit."""
+        max_size_mb = int(
+            self.config.get_value(CONF_THUMB_CACHE_MAX_SIZE) or DEFAULT_THUMB_CACHE_MAX_SIZE_MB
+        )
+        removed = await cleanup_thumb_cache(self.mass.cache_path, max_size_mb * 1024 * 1024)
+        if removed:
+            self.logger.debug("Thumbnail cache cleanup: removed %s file(s)", removed)
+        self.mass.call_later(THUMB_CACHE_CLEANUP_INTERVAL, self._cleanup_thumb_cache)
 
     async def _scan_missing_metadata(self) -> None:
         """Scanner for (missing) metadata, runs periodically in the background."""
