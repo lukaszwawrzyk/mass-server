@@ -642,12 +642,11 @@ class ChromecastPlayer(Player):
         """Handle updated CastStatus."""
         if status is None:
             return  # guard
-        self.logger.log(
-            VERBOSE_LOG_LEVEL,
-            "Received cast status for %s - app_id: %s - volume: %s",
+        self.logger.debug(
+            "Received cast status for %s - app_id: %s - playback: %s",
             self.display_name,
             status.app_id,
-            status.volume_level,
+            self._attr_playback_state,
         )
         # handle stereo pairs
         if self.cast_info.is_multichannel_group:
@@ -671,6 +670,18 @@ class ChromecastPlayer(Player):
         self._attr_volume_level = round(status.volume_level * 100)
         self._attr_volume_muted = status.volume_muted
         new_powered = self.cc.app_id is not None and self.cc.app_id != IDLE_APP_ID
+        if (
+            not new_powered
+            and self._attr_playback_state
+            in (PlaybackState.PLAYING, PlaybackState.PAUSED)
+        ):
+            self.logger.debug(
+                "[%s] Cast app closed while playing - transitioning to IDLE",
+                self.cast_info.friendly_name,
+            )
+            self._attr_playback_state = PlaybackState.IDLE
+            self._attr_current_media = None
+            self._attr_active_source = None
         self._attr_powered = new_powered
         if self._attr_powered and not new_powered and self.type == PlayerType.GROUP:
             # group is being powered off, update group childs
@@ -681,11 +692,11 @@ class ChromecastPlayer(Player):
 
     def on_new_media_status(self, status: MediaStatus) -> None:  # noqa: PLR0915
         """Handle updated MediaStatus."""
-        self.logger.log(
-            VERBOSE_LOG_LEVEL,
-            "Received media status for %s update: %s",
+        self.logger.debug(
+            "Received media status for %s: state=%s content_id=%s",
             self.display_name,
             status.player_state,
+            status.content_id,
         )
         # In Sendspin mode, state is synced from the Sendspin player - skip Cast media status
         if self.sendspin_mode_enabled:

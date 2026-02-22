@@ -1952,6 +1952,12 @@ class PlayerQueuesController(CoreController):
             abort_existing=True,
         )
 
+        # schedule a watchdog timer to detect stuck playback
+        if not queue.flow_mode and current_item.duration:
+            self._schedule_advancement_watchdog(
+                queue_id, item_id_in_buffer, current_item.duration
+            )
+
     async def _resolve_media_items(
         self,
         media_item: MediaItemType | ItemMapping | BrowseFolder,
@@ -2309,6 +2315,12 @@ class PlayerQueuesController(CoreController):
             else:
                 # same track, use the max of current and previous to handle timing issues
                 last_playing_elapsed_time = max(current_elapsed, prev_playing_elapsed)
+        elif prev_state["state"] == PlaybackState.PLAYING:
+            # transitioning away from PLAYING: compute corrected elapsed time
+            # because queue.elapsed_time is stale from the last PLAYING status update
+            # while real playback may have continued beyond that point
+            corrected = queue.elapsed_time + (time.time() - queue.elapsed_time_last_updated)
+            last_playing_elapsed_time = max(int(corrected), prev_playing_elapsed)
         else:
             last_playing_elapsed_time = prev_playing_elapsed
         new_state = CompareState(
@@ -2405,7 +2417,27 @@ class PlayerQueuesController(CoreController):
 
         # check if we need to clear the queue if we reached the end
         if "state" in changed_keys and queue.state == PlaybackState.IDLE:
+            self._handle_idle_with_next_item(queue, prev_state, new_state)
             self._handle_end_of_queue(queue, prev_state, new_state)
+
+        # watchdog: detect ghost PLAYING state where elapsed time overruns track duration
+        # (player reports PLAYING but the track has actually finished)
+        if (
+            queue.state == PlaybackState.PLAYING
+            and not queue.flow_mode
+            and queue.current_item
+            and queue.next_item
+        ):
+            item_duration = None
+            if queue.current_item.streamdetails:
+                item_duration = (
+                    queue.current_item.streamdetails.duration
+                    or queue.current_item.duration
+                )
+            elif queue.current_item.duration:
+                item_duration = queue.current_item.duration
+            if item_duration and queue.corrected_elapsed_time > item_duration + 15:
+                self._handle_playback_overrun(queue)
 
         # watch dynamic radio items refill if needed
         if "current_item_id" in changed_keys:
@@ -2583,6 +2615,188 @@ class PlayerQueuesController(CoreController):
         # only clear if the last track was played to near completion (within 5 seconds of end)
         if seconds_played >= (duration or 3600) - 5:
             self.mass.create_task(_clear_queue_delayed())
+
+    def _handle_idle_with_next_item(
+        self, queue: PlayerQueue, prev_state: CompareState, new_state: CompareState
+    ) -> None:
+        """Fallback: force next track if player unexpectedly goes idle near track end."""
+        if not (
+            prev_state["state"] in (PlaybackState.PLAYING, PlaybackState.PAUSED)
+            and new_state["state"] == PlaybackState.IDLE
+        ):
+            return
+        if queue.flow_mode or queue.next_item is None:
+            return
+
+        prev_item = prev_state["current_item"]
+        if prev_item and (streamdetails := prev_item.streamdetails):
+            duration = streamdetails.duration or prev_item.duration or 24 * 3600
+        elif prev_item:
+            duration = prev_item.duration or 24 * 3600
+        else:
+            return
+
+        # only run this fallback when the previous item was effectively at the end
+        seconds_played = int(prev_state["last_playing_elapsed_time"])
+        self.logger.debug(
+            "Idle-with-next-item check for %s: seconds_played=%s, duration=%s, threshold=%s",
+            queue.display_name,
+            seconds_played,
+            duration,
+            (duration or 3600) - 5,
+        )
+        if seconds_played < (duration or 3600) - 5:
+            return
+
+        prev_item_id = prev_item.queue_item_id
+        next_item_id = queue.next_item.queue_item_id
+
+        async def _try_force_next() -> None:
+            await asyncio.sleep(1.5)
+            latest_queue = self._queues.get(queue.queue_id)
+            if not latest_queue:
+                return
+            if latest_queue.state != PlaybackState.IDLE:
+                return
+            if not latest_queue.current_item or latest_queue.current_item.queue_item_id != prev_item_id:
+                return
+            if not latest_queue.next_item or latest_queue.next_item.queue_item_id != next_item_id:
+                return
+            self.logger.warning(
+                "Player %s became IDLE before starting queued next item; forcing next track",
+                latest_queue.display_name,
+            )
+            with suppress(MusicAssistantError):
+                await self.next(latest_queue.queue_id)
+
+        self.mass.create_task(
+            _try_force_next(),
+            task_id=f"idle_next_fallback_{queue.queue_id}",
+            abort_existing=True,
+        )
+
+    def _schedule_advancement_watchdog(
+        self, queue_id: str, item_id: str, duration: int
+    ) -> None:
+        """Schedule a timer that fires after the track should have ended.
+
+        This is the last line of defence against stuck playback: if the player
+        stops sending callbacks altogether (e.g. Chromecast Cast app silently
+        closes), none of the event-driven checks can fire. This timer is
+        independent of any player callbacks.
+        """
+        remaining = max(duration - int(self._queues[queue_id].elapsed_time), 10)
+        delay = remaining + 20
+        self.logger.debug(
+            "Scheduled advancement watchdog for %s: fires in %ds"
+            " (duration=%d, remaining=%d)",
+            self._queues[queue_id].display_name,
+            delay,
+            duration,
+            remaining,
+        )
+
+        async def _watchdog() -> None:
+            await asyncio.sleep(delay)
+            queue = self._queues.get(queue_id)
+            if not queue or not queue.active:
+                return
+            if queue.current_item and queue.current_item.queue_item_id != item_id:
+                # queue already advanced to a different track - all good
+                return
+
+            # check if the player has gone silent (no updates for a while)
+            player = self.mass.players.get_player(queue_id)
+            if player and player.state.elapsed_time_last_updated:
+                age = time.time() - player.state.elapsed_time_last_updated
+                self.logger.debug(
+                    "Watchdog fired for %s: state=%s, last_update=%.0fs ago,"
+                    " item_match=%s",
+                    queue.display_name,
+                    queue.state,
+                    age,
+                    (
+                        queue.current_item
+                        and queue.current_item.queue_item_id == item_id
+                    ),
+                )
+                if age < 60:
+                    # player is still actively reporting - don't interfere,
+                    # the event-driven code should handle transitions
+                    self.logger.debug(
+                        "Watchdog: %s player still active (%.0fs ago)"
+                        " - skipping",
+                        queue.display_name,
+                        age,
+                    )
+                    return
+
+            if queue.state == PlaybackState.IDLE and queue.next_item:
+                self.logger.warning(
+                    "Watchdog: %s is IDLE with next item pending"
+                    " - forcing next track",
+                    queue.display_name,
+                )
+                with suppress(MusicAssistantError):
+                    await self.next(queue_id)
+                return
+            if queue.state == PlaybackState.PLAYING and queue.current_item:
+                self.logger.warning(
+                    "Watchdog: %s player silent, still on same track"
+                    " after expected end (elapsed=%.0f, duration=%d)"
+                    " - forcing next track",
+                    queue.display_name,
+                    queue.corrected_elapsed_time,
+                    duration,
+                )
+                with suppress(MusicAssistantError):
+                    await self.next(queue_id)
+
+        self.mass.create_task(
+            _watchdog(),
+            task_id=f"advancement_watchdog_{queue_id}",
+            abort_existing=True,
+        )
+
+    def _handle_playback_overrun(self, queue: PlayerQueue) -> None:
+        """Force next track when elapsed time exceeds track duration (ghost PLAYING state).
+
+        Some players (e.g. Chromecast) may stop sending status updates when a
+        track ends but the Cast app closes without an IDLE media status. The
+        queue controller then keeps seeing PLAYING with an ever-increasing
+        corrected_elapsed_time. This watchdog catches that scenario.
+        """
+        task_id = f"playback_overrun_{queue.queue_id}"
+        if self.mass.get_task(task_id):
+            return
+
+        current_item_id = (
+            queue.current_item.queue_item_id if queue.current_item else None
+        )
+
+        async def _force_next_on_overrun() -> None:
+            await asyncio.sleep(2)
+            latest_queue = self._queues.get(queue.queue_id)
+            if not latest_queue or latest_queue.state != PlaybackState.PLAYING:
+                return
+            if (
+                not latest_queue.current_item
+                or latest_queue.current_item.queue_item_id != current_item_id
+            ):
+                return
+            self.logger.warning(
+                "Player %s still reports PLAYING but track duration exceeded"
+                " - forcing next track",
+                latest_queue.display_name,
+            )
+            with suppress(MusicAssistantError):
+                await self.next(latest_queue.queue_id)
+
+        self.mass.create_task(
+            _force_next_on_overrun(),
+            task_id=task_id,
+            abort_existing=True,
+        )
 
     def _handle_playback_progress_report(
         self, queue: PlayerQueue, prev_state: CompareState, new_state: CompareState
