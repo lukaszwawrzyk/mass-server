@@ -1031,6 +1031,42 @@ class PlayerQueuesController(CoreController):
             resume_item = self.get_item(queue_id, 0)
             resume_pos = 0
 
+        # In flow mode, queue.current_item may not reflect the actual playing track
+        # because _get_flow_queue_stream_index depends on elapsed_time which can be
+        # stale or reset when a player transitions to IDLE. Use flow_mode_stream_log
+        # to determine the correct resume point.
+        if resume_item and queue.flow_mode and queue.flow_mode_stream_log:
+            last_log_entry = queue.flow_mode_stream_log[-1]
+            last_log_index = self.index_by_id(queue_id, last_log_entry.queue_item_id)
+            if last_log_index is not None:
+                log_item = self.get_item(queue_id, last_log_index)
+                if log_item is not None:
+                    if last_log_entry.seconds_streamed is not None:
+                        # last track finished streaming, resume from the next track
+                        next_idx = self._get_next_index(queue_id, last_log_index)
+                        if next_idx is not None:
+                            next_item = self.get_item(queue_id, next_idx)
+                            if next_item is not None:
+                                self.logger.info(
+                                    "Flow mode resume: last streamed track %s (%s) finished, "
+                                    "advancing to next track %s (%s)",
+                                    log_item.name,
+                                    last_log_entry.queue_item_id,
+                                    next_item.name,
+                                    next_item.queue_item_id,
+                                )
+                                resume_item = next_item
+                                resume_pos = 0
+                    else:
+                        # track was still streaming when interrupted
+                        self.logger.info(
+                            "Flow mode resume: resuming from in-progress track %s (%s) (was: %s)",
+                            log_item.name,
+                            last_log_entry.queue_item_id,
+                            queue.current_item.name if queue.current_item else "None",
+                        )
+                        resume_item = log_item
+
         if resume_item is not None:
             queue_player = self.mass.players.get_player(queue_id)
             if queue_player is None:

@@ -1026,6 +1026,11 @@ class StreamsController(CoreController):
         if not start_queue_item:
             # this can happen in some (edge case) race conditions
             return
+        # capture session_id and a local reference to flow_mode_stream_log
+        # so that if a new session starts (and replaces the log list), this
+        # generator stops writing to a stale reference
+        session_id = queue.session_id
+        flow_log = queue.flow_mode_stream_log
         pcm_sample_size = pcm_format.pcm_sample_size
         if start_queue_item.media_type != MediaType.TRACK:
             # no crossfade on non-tracks
@@ -1050,6 +1055,15 @@ class StreamsController(CoreController):
         total_chunks_received = 0
 
         while True:
+            # stop this generator if a new session has started
+            if queue.session_id != session_id:
+                self.logger.debug(
+                    "Flow stream for queue %s stopping: session changed (%s -> %s)",
+                    queue.display_name,
+                    session_id,
+                    queue.session_id,
+                )
+                break
             # get (next) queue item to stream
             if queue_track is None:
                 queue_track = start_queue_item
@@ -1078,7 +1092,7 @@ class StreamsController(CoreController):
             )
             # append to play log so the queue controller can work out which track is playing
             play_log_entry = PlayLogEntry(queue_track.queue_item_id)
-            queue.flow_mode_stream_log.append(play_log_entry)
+            flow_log.append(play_log_entry)
             # calculate crossfade buffer size
             crossfade_buffer_duration = (
                 SMART_CROSSFADE_DURATION
@@ -1305,7 +1319,7 @@ class StreamsController(CoreController):
         )
 
         async def fetch_announcement() -> None:
-            fmt = announcement_url.rsplit(".")[-1]
+            fmt = announcement_url.rsplit(".", maxsplit=1)[-1]
             async for chunk in get_ffmpeg_stream(
                 audio_input=announcement_url,
                 input_format=AudioFormat(content_type=ContentType.try_parse(fmt)),
