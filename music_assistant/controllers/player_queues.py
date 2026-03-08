@@ -856,6 +856,13 @@ class PlayerQueuesController(CoreController):
         queue_active = queue.active
         if queue.active and queue.state == PlaybackState.PLAYING:
             queue.resume_pos = int(queue.corrected_elapsed_time)
+            self.logger.debug(
+                "Pause: saved resume_pos=%s for queue %s (current_item=%s, current_index=%s)",
+                queue.resume_pos,
+                queue.display_name,
+                queue.current_item.name if queue.current_item else None,
+                queue.current_index,
+            )
         # forward the actual command to the player controller
         # Set context to prevent circular call, then forward the actual command to the player
         token = IN_QUEUE_COMMAND.set(True)
@@ -1016,6 +1023,21 @@ class PlayerQueuesController(CoreController):
         queue = self._queues[queue_id]
         queue_items = self._queue_items[queue_id]
         resume_item = queue.current_item
+        self.logger.debug(
+            "Resume called for queue %s: state=%s, current_item=%s, "
+            "current_index=%s, resume_pos=%s, elapsed_time=%s, "
+            "elapsed_time_last_updated=%s, flow_mode=%s, "
+            "flow_mode_stream_log_len=%s",
+            queue.display_name,
+            queue.state,
+            resume_item.name if resume_item else None,
+            queue.current_index,
+            queue.resume_pos,
+            queue.elapsed_time,
+            queue.elapsed_time_last_updated,
+            queue.flow_mode,
+            len(queue.flow_mode_stream_log),
+        )
         if queue.state == PlaybackState.PLAYING:
             # resume requested while already playing,
             # use current position as resume position
@@ -1032,6 +1054,12 @@ class PlayerQueuesController(CoreController):
             resume_item = self.get_item(queue_id, 0)
             resume_pos = 0
 
+        self.logger.debug(
+            "Resume for queue %s: final resume_item=%s, resume_pos=%s",
+            queue.display_name,
+            resume_item.name if resume_item else None,
+            resume_pos,
+        )
         if resume_item is not None:
             queue_player = self.mass.players.get_player(queue_id)
             if queue_player is None:
