@@ -813,6 +813,7 @@ class PlayerQueuesController(CoreController):
         if (queue := self.get(queue_id)) and queue.active:
             if queue.state == PlaybackState.PLAYING:
                 queue.resume_pos = int(queue.corrected_elapsed_time)
+            queue.state = PlaybackState.IDLE
         # Set context to prevent circular call, then forward the actual command to the player
         token = IN_QUEUE_COMMAND.set(True)
         try:
@@ -1057,25 +1058,9 @@ class PlayerQueuesController(CoreController):
                                 )
                                 resume_item = next_item
                                 resume_pos = 0
-                    # last log entry was still streaming (buffering ahead),
-                    # but the player may still be playing an earlier track.
-                    # Trust queue.current_item if it differs from the last log entry,
-                    # as it reflects actual player position via elapsed_time.
-                    elif (
-                        queue.current_item
-                        and queue.current_item.queue_item_id
-                        != last_log_entry.queue_item_id
-                    ):
-                        self.logger.info(
-                            "Flow mode resume: last buffered track %s (%s) "
-                            "but player was still on %s, keeping current item",
-                            log_item.name,
-                            last_log_entry.queue_item_id,
-                            queue.current_item.name,
-                        )
-                        # resume_item and resume_pos are already correct
-                        # (set from queue.current_item and queue.resume_pos above)
-                    else:
+                    elif not queue.current_item:
+                        # last log entry was still streaming when interrupted
+                        # and current_item is missing - use the log entry
                         self.logger.info(
                             "Flow mode resume: resuming from in-progress track %s (%s)",
                             log_item.name,
