@@ -1057,15 +1057,32 @@ class PlayerQueuesController(CoreController):
                                 )
                                 resume_item = next_item
                                 resume_pos = 0
-                    else:
-                        # track was still streaming when interrupted
+                    # last log entry was still streaming (buffering ahead),
+                    # but the player may still be playing an earlier track.
+                    # Trust queue.current_item if it differs from the last log entry,
+                    # as it reflects actual player position via elapsed_time.
+                    elif (
+                        queue.current_item
+                        and queue.current_item.queue_item_id
+                        != last_log_entry.queue_item_id
+                    ):
                         self.logger.info(
-                            "Flow mode resume: resuming from in-progress track %s (%s) (was: %s)",
+                            "Flow mode resume: last buffered track %s (%s) "
+                            "but player was still on %s, keeping current item",
                             log_item.name,
                             last_log_entry.queue_item_id,
-                            queue.current_item.name if queue.current_item else "None",
+                            queue.current_item.name,
+                        )
+                        # resume_item and resume_pos are already correct
+                        # (set from queue.current_item and queue.resume_pos above)
+                    else:
+                        self.logger.info(
+                            "Flow mode resume: resuming from in-progress track %s (%s)",
+                            log_item.name,
+                            last_log_entry.queue_item_id,
                         )
                         resume_item = log_item
+                        resume_pos = 0
 
         if resume_item is not None:
             queue_player = self.mass.players.get_player(queue_id)
