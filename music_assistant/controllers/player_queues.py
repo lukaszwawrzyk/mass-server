@@ -869,6 +869,7 @@ class PlayerQueuesController(CoreController):
         # some players (e.g. Chromecast) report stale/incorrect playback state
         # after pause which can reset current_index to 0
         self._transitioning_players.add(queue_id)
+        queue.state = PlaybackState.PAUSED
         # forward the actual command to the player controller
         # Set context to prevent circular call, then forward the actual command to the player
         token = IN_QUEUE_COMMAND.set(True)
