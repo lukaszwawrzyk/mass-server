@@ -814,6 +814,7 @@ class PlayerQueuesController(CoreController):
             if queue.state == PlaybackState.PLAYING:
                 queue.resume_pos = int(queue.corrected_elapsed_time)
             queue.state = PlaybackState.IDLE
+        self._transitioning_players.discard(queue_id)
         # Set context to prevent circular call, then forward the actual command to the player
         token = IN_QUEUE_COMMAND.set(True)
         try:
@@ -838,6 +839,7 @@ class PlayerQueuesController(CoreController):
             and queue.state == PlaybackState.PAUSED
         ):
             # forward the actual play/unpause command to the player
+            self._transitioning_players.discard(queue_id)
             await queue_player.play()
             return
         # player is not paused, perform resume instead
@@ -863,6 +865,10 @@ class PlayerQueuesController(CoreController):
                 queue.current_item.name if queue.current_item else None,
                 queue.current_index,
             )
+        # block player updates from corrupting queue state while paused
+        # some players (e.g. Chromecast) report stale/incorrect playback state
+        # after pause which can reset current_index to 0
+        self._transitioning_players.add(queue_id)
         # forward the actual command to the player controller
         # Set context to prevent circular call, then forward the actual command to the player
         token = IN_QUEUE_COMMAND.set(True)
