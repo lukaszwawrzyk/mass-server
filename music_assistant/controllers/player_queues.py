@@ -2583,6 +2583,14 @@ class PlayerQueuesController(CoreController):
                     track_sec_skipped = 0
                 track_time = elapsed_time_queue_total + track_sec_skipped - played_time
                 break
+        else:
+            # player elapsed time exceeded all logged tracks - this happens when
+            # the player is ahead of the buffer (playing from cache while the next
+            # track just started buffering). Use the last log entry as current track.
+            if queue.flow_mode_stream_log:
+                last_entry = queue.flow_mode_stream_log[-1]
+                queue_index = self.index_by_id(queue.queue_id, last_entry.queue_item_id)
+                track_time = elapsed_time_queue_total - played_time
         if player.state.playback_state != PlaybackState.PLAYING:
             # if the player is not playing, we can't be sure that the elapsed time is correct
             # so we just return the queue index and the elapsed time
