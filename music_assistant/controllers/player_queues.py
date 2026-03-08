@@ -2331,6 +2331,14 @@ class PlayerQueuesController(CoreController):
                 return
 
             # get current/next item based on current index
+            if queue.flow_mode and current_index != queue.current_index:
+                self.logger.debug(
+                    "Flow mode track change for %s: index %s -> %s (elapsed_time=%s)",
+                    queue.display_name,
+                    queue.current_index,
+                    current_index,
+                    elapsed_time,
+                )
             queue.current_index = current_index
             queue.current_item = current_item = self.get_item(queue_id, current_index)
             queue.next_item = (
