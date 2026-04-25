@@ -661,6 +661,11 @@ class PlayerQueuesController(CoreController):
         if (queue := self.get(queue_id)) and queue.active:
             if queue.state == PlaybackState.PLAYING:
                 queue.resume_pos = int(queue.corrected_elapsed_time)
+            # Force IDLE so a later resume() takes the resume_pos branch.
+            # During announcements (e.g. TTS) on_player_update is suppressed,
+            # so queue.state would otherwise stay PLAYING and resume() would
+            # use corrected_elapsed_time (inflated by the announcement).
+            queue.state = PlaybackState.IDLE
         # Use internal handler to avoid circular redirect:
         # public cmd_stop redirects to queue.stop when a queue is active,
         # which would loop back here indefinitely.
@@ -694,6 +699,14 @@ class PlayerQueuesController(CoreController):
         queue_active = queue.active
         if queue.active and queue.state == PlaybackState.PLAYING:
             queue.resume_pos = int(queue.corrected_elapsed_time)
+        # Block player updates from corrupting queue state while paused.
+        # Some players (e.g. Chromecast) report stale PLAYING with near-zero
+        # elapsed time after pause, which causes _get_flow_queue_stream_index
+        # to reset current_index to 0 (first track) and resume() to start the
+        # playlist from the beginning. The flag is cleared by play()/resume()/
+        # stop() before they hand control back to the player.
+        self._transitioning_players.add(queue_id)
+        queue.state = PlaybackState.PAUSED
         # Use internal handler to avoid circular redirect
         # (cmd_pause redirects to queue.pause, which calls cmd_pause again)
         await self.mass.players._handle_cmd_pause(queue_id)
@@ -1498,6 +1511,8 @@ class PlayerQueuesController(CoreController):
             and queue.active
             and queue.state == PlaybackState.PAUSED
         ):
+            # clear the pause-time guard so player updates flow again once unpaused
+            self._transitioning_players.discard(queue_id)
             # forward the actual play/unpause command to the player
             await queue_player.play()
             return
@@ -2915,6 +2930,16 @@ class PlayerQueuesController(CoreController):
                     track_sec_skipped = 0
                 track_time = elapsed_time_queue_total + track_sec_skipped - played_time
                 break
+        else:
+            # Player elapsed time exceeded all logged tracks - happens when the
+            # player is ahead of the buffer (playing from cache while the next
+            # track has only just started buffering). Fall back to the last log
+            # entry so the UI does not show the wrong track with an
+            # ever-growing elapsed time.
+            if queue.flow_mode_stream_log:
+                last_entry = queue.flow_mode_stream_log[-1]
+                queue_index = self.index_by_id(queue.queue_id, last_entry.queue_item_id)
+                track_time = elapsed_time_queue_total - played_time
         if player.state.playback_state != PlaybackState.PLAYING:
             # if the player is not playing, we can't be sure that the elapsed time is correct
             # so we just return the queue index and the elapsed time
