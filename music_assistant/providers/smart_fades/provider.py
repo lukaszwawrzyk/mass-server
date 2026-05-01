@@ -14,13 +14,14 @@ from beat_this.inference import Spect2Frames
 from music_assistant_models.enums import MediaType
 from torchaudio.transforms import SpectralCentroid
 
-from music_assistant.constants import VERBOSE_LOG_LEVEL
+from music_assistant.constants import CONF_SMART_FADES_MODE, VERBOSE_LOG_LEVEL
 from music_assistant.helpers.util import is_arm
 from music_assistant.models.audio_analysis import AudioAnalysisData
 from music_assistant.models.audio_analysis_provider import (
     ACCUMULATING_ANALYSIS_MAX_DURATION_SECONDS,
     AudioAnalysisProvider,
 )
+from music_assistant.models.smart_fades import SmartFadesMode
 
 from .dbn_postprocessor import DBNDownBeatTracker
 from .feature_extractor import AdvancedBeatFeatureExtractor
@@ -167,6 +168,21 @@ class SmartFadesProvider(AudioAnalysisProvider):
         if streamdetails.media_type != MediaType.TRACK:
             # We only want to analyze tracks
             return False
+        if streamdetails.queue_id:
+            smart_fades_mode = SmartFadesMode(
+                self.mass.config.get_raw_player_config_value(
+                    streamdetails.queue_id,
+                    CONF_SMART_FADES_MODE,
+                    SmartFadesMode.DISABLED,
+                )
+            )
+            if smart_fades_mode != SmartFadesMode.SMART_CROSSFADE:
+                self.logger.debug(
+                    "Skipping beat tracking session %s because smart fades mode is %s",
+                    session_id,
+                    smart_fades_mode,
+                )
+                return False
 
         block_seconds = 10.0
 

@@ -11,7 +11,9 @@ from music_assistant_models.enums import ContentType, MediaType
 from music_assistant_models.errors import SetupFailedError
 from music_assistant_models.media_items import AudioFormat
 
+from music_assistant.constants import CONF_SMART_FADES_MODE
 from music_assistant.models.audio_analysis import AudioAnalysisData
+from music_assistant.models.smart_fades import SmartFadesMode
 from music_assistant.providers.smart_fades.provider import SmartFadesProvider
 
 FIXTURE_DIR = Path(__file__).parent / "fixtures"
@@ -85,6 +87,9 @@ def mass_mock() -> Mock:
     mass.streams.audio_analysis.set_audio_analysis = AsyncMock()
     mass.config = Mock()
     mass.config.get = Mock(return_value={})
+    mass.config.get_raw_player_config_value = Mock(
+        return_value=SmartFadesMode.SMART_CROSSFADE
+    )
     return mass
 
 
@@ -115,6 +120,41 @@ async def provider(mass_mock: Mock, manifest_mock: Mock, config_mock: Mock) -> S
     prov = SmartFadesProvider(mass_mock, manifest_mock, config_mock, set())
     await prov.handle_async_init()
     return prov
+
+
+@pytest.mark.parametrize(
+    "smart_fades_mode",
+    [SmartFadesMode.DISABLED, SmartFadesMode.STANDARD_CROSSFADE],
+)
+async def test_live_analysis_requires_smart_crossfade(
+    mass_mock: Mock,
+    manifest_mock: Mock,
+    config_mock: Mock,
+    smart_fades_mode: SmartFadesMode,
+) -> None:
+    """Do not spend CPU on beat analysis unless smart crossfade is enabled."""
+    mass_mock.config.get_raw_player_config_value.return_value = smart_fades_mode
+    prov = SmartFadesProvider(mass_mock, manifest_mock, config_mock, set())
+    audio_format = AudioFormat(
+        content_type=ContentType.PCM_F32LE,
+        bit_depth=32,
+        sample_rate=44100,
+        channels=2,
+    )
+    stream_details = Mock()
+    stream_details.item_id = "test_track"
+    stream_details.provider = "test"
+    stream_details.queue_id = "queue_1"
+    stream_details.uri = "test://track"
+    stream_details.media_type = MediaType.TRACK
+
+    accepted = await prov.start_analysis("test:test:test_track", stream_details, audio_format)
+
+    assert accepted is False
+    assert prov._data == {}
+    mass_mock.config.get_raw_player_config_value.assert_called_once_with(
+        "queue_1", CONF_SMART_FADES_MODE, SmartFadesMode.DISABLED
+    )
 
 
 async def test_beat_detection(provider: SmartFadesProvider, mass_mock: Mock) -> None:
