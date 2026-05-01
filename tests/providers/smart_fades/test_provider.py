@@ -101,6 +101,9 @@ def mass_mock() -> Mock:
     mass.streams.audio_analysis.get_audio_analysis_version = AsyncMock(return_value=None)
     mass.streams.audio_analysis.set_audio_analysis = AsyncMock()
     mass.streams.audio_analysis.playback_active = Mock(return_value=False)
+    mass.streams.is_smart_fades_active = Mock(return_value=True)
+    mass.player_queues = Mock()
+    mass.player_queues.get = Mock(return_value=Mock())
     mass.config = Mock()
     mass.config.get = Mock(return_value={})
     return mass
@@ -150,6 +153,38 @@ async def provider(mass_mock: Mock, manifest_mock: Mock, config_mock: Mock) -> S
         await prov.handle_async_init()
     prov._models = _stub_models()
     return prov
+
+
+async def test_live_analysis_requires_smart_crossfade(
+    mass_mock: Mock,
+    manifest_mock: Mock,
+    config_mock: Mock,
+) -> None:
+    """Test that live analysis is only started for smart crossfade queues."""
+    mass_mock.streams.is_smart_fades_active.return_value = False
+    prov = SmartFadesProvider(mass_mock, manifest_mock, config_mock, set())
+    audio_format = AudioFormat(
+        content_type=ContentType.PCM_F32LE,
+        bit_depth=32,
+        sample_rate=44100,
+        channels=2,
+    )
+    stream_details = Mock()
+    stream_details.item_id = "test_track"
+    stream_details.provider = "test"
+    stream_details.queue_id = "queue_1"
+    stream_details.uri = "test://track"
+    stream_details.media_type = MediaType.TRACK
+    stream_details.duration = 180
+
+    accepted = await prov.start_analysis("test:test:test_track", stream_details, audio_format)
+
+    assert accepted is False
+    assert prov._data == {}
+    mass_mock.player_queues.get.assert_called_once_with("queue_1")
+    mass_mock.streams.is_smart_fades_active.assert_called_once_with(
+        mass_mock.player_queues.get.return_value
+    )
 
 
 @pytest.fixture

@@ -258,6 +258,15 @@ class SmartFadesProvider(AudioAnalysisProvider):
             # We only want to analyze tracks
             return False
 
+        if streamdetails.queue_id:
+            queue = self.mass.player_queues.get(streamdetails.queue_id)
+            if queue is None or not self.mass.streams.is_smart_fades_active(queue):
+                self.logger.debug(
+                    "Skipping beat tracking session %s because smart fades are not active",
+                    session_id,
+                )
+                return False
+
         models = self._require_models()
         block_seconds = 10.0
 
