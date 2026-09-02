@@ -375,6 +375,13 @@ class PlaybackTrackerMixin(_PlayerQueuesBase):
                 stream_pos_in_item = elapsed_time_queue_total - played_time
                 track_time = track_sec_skipped + stream_pos_in_item * entry_speed
                 break
+        else:
+            # The player can be ahead of the buffer while playing cached audio. Keep
+            # reporting the last logged item instead of resetting to queue index zero.
+            if flow_log:
+                last_entry = flow_log[-1]
+                queue_index = self.index_by_id(queue.queue_id, last_entry.queue_item_id)
+                track_time = elapsed_time_queue_total - played_time
         if player.state.playback_state != PlaybackState.PLAYING:
             # if the player is not playing, we can't be sure that the elapsed time is correct
             # so we just return the queue index and the elapsed time

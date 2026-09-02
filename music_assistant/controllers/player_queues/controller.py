@@ -719,6 +719,9 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
         queue_active = queue.active
         if queue.active and queue.state == PlaybackState.PLAYING:
             queue.resume_pos = int(queue.corrected_elapsed_time)
+        # Ignore stale PLAYING updates (notably from Cast) until playback resumes.
+        self._set_transitioning(queue_id, True)
+        queue.state = PlaybackState.PAUSED
         # Use internal handler to avoid circular redirect
         # (cmd_pause redirects to queue.pause, which calls cmd_pause again)
         await self.mass.players._handle_cmd_pause(queue_id)
@@ -1819,6 +1822,9 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
         if (queue := self.get(queue_id)) and queue.active:
             if queue.state == PlaybackState.PLAYING:
                 queue.resume_pos = int(queue.corrected_elapsed_time)
+            # Announcements suppress player updates, so pin the stopped state here;
+            # otherwise resume can use elapsed time inflated by the announcement.
+            queue.state = PlaybackState.IDLE
         try:
             # Use internal handler to avoid circular redirect:
             # public cmd_stop redirects to queue.stop when a queue is active,
@@ -1844,6 +1850,7 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
         if queue_player is None:
             raise PlayerUnavailableError(f"Player {queue_id} is not available")
         if (queue := self.get(queue_id)) and queue.active and queue.state == PlaybackState.PAUSED:
+            self._set_transitioning(queue_id, False)
             # forward the actual play/unpause command to the player,
             # holding the action until the player confirms it resumed playback
             async with self.mass.players.wait_for_player_update(
