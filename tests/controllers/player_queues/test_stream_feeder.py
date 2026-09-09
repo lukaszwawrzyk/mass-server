@@ -136,6 +136,33 @@ def _controller_with_next_item() -> tuple[PlayerQueuesController, SimpleNamespac
     return controller, next_item, mass
 
 
+async def test_prepare_next_uses_streamed_item_when_flow_progress_lags() -> None:
+    """Prewarming follows the item being streamed, not stale audible queue progress."""
+    controller, stale_next_item, mass = _controller_with_next_item()
+    streamed_item = SimpleNamespace(queue_item_id="streamed")
+    actual_next_item = SimpleNamespace(
+        queue_item_id="actual-next",
+        media_type=MediaType.TRACK,
+        streamdetails=SimpleNamespace(buffer=None),
+        name="Actual next",
+        available=True,
+    )
+    controller.get_next_item = MagicMock(return_value=actual_next_item)  # type: ignore[method-assign]
+    mass.streams.audio.get_audio_buffer = AsyncMock()
+
+    controller.prepare_next_audio_buffer("queue-1", after_item_id=streamed_item.queue_item_id)
+    await mass.create_task.call_args.args[0]()
+
+    controller.get_next_item.assert_called_once_with("queue-1", streamed_item.queue_item_id)
+    mass.streams.audio.get_audio_buffer.assert_awaited_once_with(
+        actual_next_item,
+        reason="prepare_next",
+        capacity_wait_timeout=STREAM_SLOT_WAIT_TIMEOUT,
+        allow_provider_match=False,
+    )
+    assert stale_next_item.streamdetails.buffer is None
+
+
 async def test_reusing_a_warm_buffer_claims_it_for_the_current_session() -> None:
     """
     A prewarm that is already warm still becomes this session's audio.
