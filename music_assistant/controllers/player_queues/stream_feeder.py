@@ -35,17 +35,26 @@ if TYPE_CHECKING:
 class StreamFeederMixin(_PlayerQueuesBase):
     """Feed the player's stream: enqueue the next item, preload/prepare its audio, clean up."""
 
-    def prepare_next_audio_buffer(self, queue_id: str) -> None:
+    def prepare_next_audio_buffer(self, queue_id: str, *, after_item_id: str | None = None) -> None:
         """
         Prepare the AudioBuffer for the next track in the queue.
 
         Called ~30-60 seconds before the current track ends to ensure
         the buffer is warm when the next track starts playing.
+
+        :param queue_id: Queue whose next item should be prepared.
+        :param after_item_id: Streamed item whose successor should be prepared.
         """
         queue = self.get(queue_id)
-        if not queue or not queue.next_item:
+        if not queue:
             return
-        next_item = queue.next_item
+        next_item = (
+            self.get_next_item(queue_id, after_item_id)
+            if after_item_id is not None
+            else queue.next_item
+        )
+        if not next_item:
+            return
         # AudioSource items are realtime/live and bypass the AudioBuffer
         if next_item.media_type == MediaType.AUDIO_SOURCE:
             return

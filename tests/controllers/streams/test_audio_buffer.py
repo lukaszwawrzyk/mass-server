@@ -1147,14 +1147,14 @@ async def test_sound_effect_next_item_triggers_prebuffer(mass_minimal: MusicAssi
     """A SOUND_EFFECT next item is pre-buffered like a track."""
     calls: list[str] = []
     mass_minimal.player_queues.prepare_next_audio_buffer = (  # type: ignore[method-assign]
-        lambda queue_id: calls.append(queue_id)
+        lambda queue_id, *, after_item_id=None: calls.append(f"{queue_id}:{after_item_id}")
     )
 
     await _stream_until_prebuffer_window(
         mass_minimal, next_item_media_type=MediaType.SOUND_EFFECT, queue_id="player_a"
     )
 
-    assert calls == ["player_a"]
+    assert calls == ["player_a:current"]
 
 
 @pytest.mark.asyncio
@@ -1162,7 +1162,7 @@ async def test_audio_source_next_item_is_not_prebuffered(mass_minimal: MusicAssi
     """A live AUDIO_SOURCE next item is still excluded from pre-buffering."""
     calls: list[str] = []
     mass_minimal.player_queues.prepare_next_audio_buffer = (  # type: ignore[method-assign]
-        lambda queue_id: calls.append(queue_id)
+        lambda queue_id, *, after_item_id=None: calls.append(f"{queue_id}:{after_item_id}")
     )
 
     await _stream_until_prebuffer_window(
@@ -1179,7 +1179,7 @@ async def test_realtime_source_leaves_the_prebuffer_to_the_source(
     """A realtime source triggers the next item itself, so the blind trigger stays quiet."""
     calls: list[str] = []
     mass_minimal.player_queues.prepare_next_audio_buffer = (  # type: ignore[method-assign]
-        lambda queue_id: calls.append(queue_id)
+        lambda queue_id, *, after_item_id=None: calls.append(f"{queue_id}:{after_item_id}")
     )
 
     await _stream_until_prebuffer_window(

@@ -1844,7 +1844,10 @@ class StreamsAudio:
                     >= streamdetails.duration - 60
                 ):
                     next_buffer_triggered = True
-                    self.mass.player_queues.prepare_next_audio_buffer(queue_item.queue_id)
+                    self.mass.player_queues.prepare_next_audio_buffer(
+                        queue_item.queue_id,
+                        after_item_id=queue_item.queue_item_id,
+                    )
                 yield chunk
                 del chunk
             finished = True
