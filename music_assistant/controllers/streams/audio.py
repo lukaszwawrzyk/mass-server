@@ -1824,12 +1824,16 @@ class StreamsAudio:
                 if (
                     not next_buffer_triggered
                     and streamdetails.duration
-                    and (queue := self.mass.player_queues.get_active_queue(queue_item.queue_id))
-                    and queue.next_item
-                    and queue.next_item.queue_item_id != queue_item.queue_item_id
-                    and queue.next_item.media_type in (MediaType.TRACK, MediaType.SOUND_EFFECT)
                     and (bytes_received / pcm_format.pcm_sample_size + seek_position)
                     >= streamdetails.duration - 60
+                    and self.mass.player_queues.get_active_queue(queue_item.queue_id)
+                    and (
+                        next_item := self.mass.player_queues.get_next_item(
+                            queue_item.queue_id, queue_item.queue_item_id
+                        )
+                    )
+                    and next_item.queue_item_id != queue_item.queue_item_id
+                    and next_item.media_type in (MediaType.TRACK, MediaType.SOUND_EFFECT)
                 ):
                     next_buffer_triggered = True
                     self.mass.player_queues.prepare_next_audio_buffer(
@@ -1864,6 +1868,7 @@ class StreamsAudio:
                 streamdetails.uri,
             )
         finally:
+            await media_stream_gen.aclose()
             seconds_streamed = bytes_received / pcm_format.pcm_sample_size
             streamdetails.seconds_streamed = seconds_streamed
             logger.log(
@@ -2027,32 +2032,35 @@ class StreamsAudio:
 
         total_chunks_received = 0
         playback_speed = cast("float", queue_item.extra_attributes.get("playback_speed", 1.0))
-        async for chunk in self.get_queue_item_stream(
-            queue_item,
-            pcm_format,
-            seek_position=discard_position,
-            playback_speed=playback_speed,
-            normalization_override=norm_override,
-            session_id=session_id,
-            exact_seek=exact_buffer_seek,
-        ):
-            total_chunks_received += 1
-            tail_window.extend(chunk)
-            del chunk
-            hold_target = tail_hold_target(queue_item, crossfade_buffer_size, frame_size)
-            if len(tail_window) <= hold_target:
-                await asyncio.sleep(0)
-                continue
-            # yield everything above the window; the slice can run short of a
-            # whole second when the window is small, so credit what is actually
-            # yielded - a nominal full-second credit inflates the play log and
-            # the reported duration
-            while len(tail_window) > hold_target:
-                pcm_slice = bytes(tail_window[: pcm_format.pcm_sample_size])
-                yield pcm_slice
-                bytes_written += len(pcm_slice)
-                del tail_window[: len(pcm_slice)]
-                await asyncio.sleep(0)
+        async with aclosing(
+            self.get_queue_item_stream(
+                queue_item,
+                pcm_format,
+                seek_position=discard_position,
+                playback_speed=playback_speed,
+                normalization_override=norm_override,
+                session_id=session_id,
+                exact_seek=exact_buffer_seek,
+            )
+        ) as item_stream:
+            async for chunk in item_stream:
+                total_chunks_received += 1
+                tail_window.extend(chunk)
+                del chunk
+                hold_target = tail_hold_target(queue_item, crossfade_buffer_size, frame_size)
+                if len(tail_window) <= hold_target:
+                    await asyncio.sleep(0)
+                    continue
+                # yield everything above the window; the slice can run short of a
+                # whole second when the window is small, so credit what is actually
+                # yielded - a nominal full-second credit inflates the play log and
+                # the reported duration
+                while len(tail_window) > hold_target:
+                    pcm_slice = bytes(tail_window[: pcm_format.pcm_sample_size])
+                    yield pcm_slice
+                    bytes_written += len(pcm_slice)
+                    del tail_window[: len(pcm_slice)]
+                    await asyncio.sleep(0)
 
         #### HANDLE END OF TRACK
 

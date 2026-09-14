@@ -112,6 +112,7 @@ class AudioBuffer:
         self._fill_started = time.monotonic()
         self._source_name = "unknown"
         self._last_access_time: float = time.time()
+        self._active_readers = 0
         self._inactivity_task: asyncio.Task[None] | None = None
         self._cancelled = False
         self._producer_error: Exception | None = None
@@ -234,17 +235,24 @@ class AudioBuffer:
             bytes_per_sample = (self.pcm_format.bit_depth // 8) * self.pcm_format.channels
             trim_bytes = samples_to_trim * bytes_per_sample
 
-        while True:
-            try:
-                self._last_access_time = time.time()
-                chunk = await self._get(chunk_number=chunk_number)
-                if trim_bytes > 0:
-                    chunk = chunk[trim_bytes:]
-                    trim_bytes = 0
-                yield chunk
-                chunk_number += 1
-            except AudioBufferEOF:
-                break
+        # A reader owns its unconsumed audio even while downstream is paused or
+        # backpressured. Per-chunk access times alone cannot express that lifetime.
+        self._active_readers += 1
+        try:
+            while True:
+                try:
+                    self._last_access_time = time.time()
+                    chunk = await self._get(chunk_number=chunk_number)
+                    if trim_bytes > 0:
+                        chunk = chunk[trim_bytes:]
+                        trim_bytes = 0
+                    yield chunk
+                    chunk_number += 1
+                except AudioBufferEOF:
+                    break
+        finally:
+            self._active_readers -= 1
+            self._last_access_time = time.time()
 
     async def read_chunk_for_analysis(self, chunk_number: int) -> bytes:
         """
@@ -294,22 +302,24 @@ class AudioBuffer:
         """
         needs_ffmpeg = bool(filter_params) or self.pcm_format != output_format
 
-        if not needs_ffmpeg:
-            async for chunk in self.get_raw_stream(
-                seek_position_ms=seek_position_ms, exact_seek=exact_seek
-            ):
-                yield chunk
-            return
+        async with aclosing(
+            self.get_raw_stream(seek_position_ms=seek_position_ms, exact_seek=exact_seek)
+        ) as raw_stream:
+            if not needs_ffmpeg:
+                async for chunk in raw_stream:
+                    yield chunk
+                return
 
-        async for chunk in get_ffmpeg_stream(
-            audio_input=self.get_raw_stream(
-                seek_position_ms=seek_position_ms, exact_seek=exact_seek
-            ),
-            input_format=self.pcm_format,
-            output_format=output_format,
-            filter_params=filter_params,
-        ):
-            yield chunk
+            async with aclosing(
+                get_ffmpeg_stream(
+                    audio_input=raw_stream,
+                    input_format=self.pcm_format,
+                    output_format=output_format,
+                    filter_params=filter_params,
+                )
+            ) as processed_stream:
+                async for chunk in processed_stream:
+                    yield chunk
 
     def fill(
         self,
@@ -376,6 +386,7 @@ class AudioBuffer:
 
     async def clear(self, cancel_inactivity_task: bool = True) -> None:
         """Reset the buffer, clearing all data and cancelling active tasks."""
+        self._cancelled = True
         chunk_count = len(self._chunks)
         LOGGER.log(
             VERBOSE_LOG_LEVEL,
@@ -405,7 +416,6 @@ class AudioBuffer:
             self._chunks = deque()
             self._discarded_chunks = 0
             self._eof_received = False
-            self._cancelled = True
             self._producer_error = None
             self.ready.clear()
             self._cancel_callbacks.clear()
@@ -465,7 +475,10 @@ class AudioBuffer:
                     and provider.max_concurrent_streams is not None
                     and not provider.has_available_stream_slot
                 )
-                if must_release_slot or time.time() - existing_buffer._last_access_time > 30:
+                if must_release_slot or (
+                    not existing_buffer._active_readers
+                    and time.time() - existing_buffer._last_access_time > 30
+                ):
                     await asyncio.shield(existing_buffer.clear())
                 # else: an active consumer is still reading via its local reference;
                 # the inactivity monitor will clean up after it finishes
@@ -761,7 +774,7 @@ class AudioBuffer:
         """
         Clear the buffer once it has been inactive for inactivity_timeout seconds.
 
-        :param inactivity_timeout: Seconds without access before the buffer is released.
+        :param inactivity_timeout: Seconds without access or playback readers before release.
         :param check_interval: Seconds between inactivity checks.
         """
         while True:
@@ -770,7 +783,7 @@ class AudioBuffer:
             # break on inactivity regardless of how many chunks remain: a rolling buffer
             # that has drained to empty (e.g. an abandoned radio stream) must still release
             # its resources and stop this monitor, otherwise the task loops forever
-            if time_since_access > inactivity_timeout:
+            if not self._active_readers and time_since_access > inactivity_timeout:
                 LOGGER.log(
                     VERBOSE_LOG_LEVEL,
                     "AudioBuffer: No activity for %.1fs, clearing (%s chunks)",

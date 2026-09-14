@@ -19,6 +19,7 @@ from music_assistant_models.queue_item import QueueItem
 from music_assistant_models.streamdetails import StreamDetails
 
 import music_assistant.controllers.streams.audio as audio_mod
+import music_assistant.controllers.streams.audio_buffer as audio_buffer_mod
 from music_assistant.controllers.streams.audio import StreamsAudio
 from music_assistant.controllers.streams.audio_buffer import (
     AudioBuffer,
@@ -1148,6 +1149,334 @@ async def test_inactivity_monitor_keeps_active_buffer() -> None:
         await monitor
 
 
+class _InactivityClock:
+    """Advance the real monitor one check at a time without wall-clock sleeps."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+        self.checks: asyncio.Queue[asyncio.Future[None]] = asyncio.Queue()
+
+    async def sleep(self, delay: float) -> None:
+        """Gate monitor checks while leaving producer scheduling unchanged."""
+        if delay != 30:
+            await asyncio.sleep(delay)
+            return
+        check = asyncio.get_running_loop().create_future()
+        self.checks.put_nowait(check)
+        await check
+
+    async def advance(self, seconds: float) -> None:
+        """Run the next scheduled inactivity check at the requested time."""
+        check = await asyncio.wait_for(self.checks.get(), timeout=1)
+        self.now += seconds
+        check.set_result(None)
+        await asyncio.sleep(0)
+
+
+@pytest.fixture
+def inactivity_clock(monkeypatch: pytest.MonkeyPatch) -> _InactivityClock:
+    """Control only the audio buffer's clock and monitor sleep."""
+    clock = _InactivityClock()
+    monkeypatch.setattr(
+        audio_buffer_mod, "time", SimpleNamespace(time=lambda: clock.now, monotonic=time.monotonic)
+    )
+    asyncio_facade = SimpleNamespace(**vars(asyncio))
+    asyncio_facade.sleep = clock.sleep
+    monkeypatch.setattr(audio_buffer_mod, "asyncio", asyncio_facade)
+    return clock
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", [BufferMode.SEEKABLE, BufferMode.ROLLING])
+async def test_paused_reader_keeps_unconsumed_tail(
+    inactivity_clock: _InactivityClock, mode: BufferMode
+) -> None:
+    """An open playback reader retains its tail across repeated expiry deadlines."""
+    buf = AudioBuffer(TEST_PCM_FORMAT, mode=mode)
+    buf.fill(_make_source(4))
+    reader = buf.get_raw_stream()
+    try:
+        assert buf._producer_task is not None
+        await buf._producer_task
+        assert await anext(reader) == _make_chunk(0)
+        for _ in range(2):
+            await inactivity_clock.advance(301)
+            assert not buf.cancelled
+        assert [chunk async for chunk in reader] == [_make_chunk(i) for i in range(1, 4)]
+        await inactivity_clock.advance(301)
+        assert buf._inactivity_task is not None
+        await asyncio.wait_for(buf._inactivity_task, timeout=1)
+        assert buf.cancelled
+    finally:
+        await reader.aclose()
+        await buf.clear()
+
+
+@pytest.mark.asyncio
+async def test_passive_analysis_does_not_keep_unowned_buffer_alive(
+    inactivity_clock: _InactivityClock,
+) -> None:
+    """A filled buffer without playback expires despite passive analysis access."""
+    buf = AudioBuffer(TEST_PCM_FORMAT)
+    buf.fill(_make_source(2))
+    try:
+        assert buf._producer_task is not None
+        await buf._producer_task
+        assert await buf.read_chunk_for_analysis(0) == _make_chunk(0)
+        await inactivity_clock.advance(301)
+        assert buf._inactivity_task is not None
+        await asyncio.wait_for(buf._inactivity_task, timeout=1)
+        assert buf.cancelled
+        assert buf.size_seconds == 0
+    finally:
+        await buf.clear()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("playback_started", [False, True])
+async def test_full_buffer_producer_cleanup_respects_reader_lifetime(
+    inactivity_clock: _InactivityClock, playback_started: bool
+) -> None:
+    """Full producers survive a playback pause but not an abandoned/unstarted stream."""
+    buf = AudioBuffer(TEST_PCM_FORMAT)
+    buf.max_size_seconds = 1
+    second_chunk_requested = asyncio.Event()
+    source_closed = asyncio.Event()
+
+    async def source() -> AsyncGenerator[bytes]:
+        try:
+            yield _make_chunk(0)
+            second_chunk_requested.set()
+            yield _make_chunk(1)
+            yield _make_chunk(2)
+        finally:
+            source_closed.set()
+
+    buf.fill(source())
+    reader = buf.get_raw_stream()
+    try:
+        await asyncio.wait_for(second_chunk_requested.wait(), timeout=1)
+        if playback_started:
+            assert await anext(reader) == _make_chunk(0)
+        assert buf.is_buffering
+        await inactivity_clock.advance(301)
+        if playback_started:
+            assert not buf.cancelled
+            assert buf.is_buffering
+            assert [chunk async for chunk in reader] == [_make_chunk(1), _make_chunk(2)]
+            assert buf._active_readers == 0
+            await inactivity_clock.advance(301)
+        assert buf._inactivity_task is not None
+        await asyncio.wait_for(buf._inactivity_task, timeout=1)
+        assert buf.cancelled
+        assert source_closed.is_set()
+        assert not buf.is_buffering
+    finally:
+        await reader.aclose()
+        await buf.clear()
+
+
+@pytest.mark.asyncio
+async def test_multiple_readers_release_independently(
+    inactivity_clock: _InactivityClock,
+) -> None:
+    """Closing one reader must not release another reader's paused playback."""
+    buf = AudioBuffer(TEST_PCM_FORMAT)
+    buf.fill(_make_source(3))
+    first, second = buf.get_raw_stream(), buf.get_raw_stream()
+    try:
+        await anext(first)
+        await anext(second)
+        assert buf._active_readers == 2
+        await first.aclose()
+        assert buf._active_readers == 1
+        await inactivity_clock.advance(301)
+        assert not buf.cancelled
+        await second.aclose()
+        assert buf._active_readers == 0
+        await inactivity_clock.advance(299)
+        assert not buf.cancelled
+        await inactivity_clock.advance(2)
+        assert buf._inactivity_task is not None
+        await asyncio.wait_for(buf._inactivity_task, timeout=1)
+        assert buf.cancelled
+    finally:
+        await first.aclose()
+        await second.aclose()
+        await buf.clear()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("filtered", [False, True])
+async def test_processed_stream_close_releases_reader(
+    monkeypatch: pytest.MonkeyPatch, filtered: bool
+) -> None:
+    """Both processing paths deterministically close their nested generators."""
+    processor_closed = False
+
+    async def processor(
+        audio_input: AsyncGenerator[bytes], **_kwargs: Any
+    ) -> AsyncGenerator[bytes]:
+        nonlocal processor_closed
+        try:
+            async for chunk in audio_input:
+                yield chunk
+        finally:
+            processor_closed = True
+
+    monkeypatch.setattr(audio_buffer_mod, "get_ffmpeg_stream", processor)
+    buf = AudioBuffer(TEST_PCM_FORMAT)
+    buf.fill(_make_source(3))
+    stream = buf.get_stream(TEST_PCM_FORMAT, filter_params=["volume=1"] if filtered else None)
+    try:
+        await anext(stream)
+        assert buf._active_readers == 1
+        await stream.aclose()
+        assert buf._active_readers == 0
+        assert processor_closed is filtered
+    finally:
+        await stream.aclose()
+        await buf.clear()
+
+
+@pytest.mark.asyncio
+async def test_waiting_reader_cancellation_releases_ownership() -> None:
+    """Cancelling a read awaiting producer data releases its playback ownership."""
+    buf = AudioBuffer(TEST_PCM_FORMAT)
+    waiting = asyncio.Event()
+
+    async def waiting_get(*, chunk_number: int) -> bytes:
+        assert chunk_number == 0
+        waiting.set()
+        await asyncio.Future[None]()
+        return b""
+
+    reader = buf.get_raw_stream()
+    with patch.object(buf, "_get", waiting_get):
+        task = asyncio.create_task(anext(reader))
+        try:
+            await asyncio.wait_for(waiting.wait(), timeout=1)
+            assert buf._active_readers == 1
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert buf._active_readers == 0
+        finally:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+            await reader.aclose()
+            await buf.clear()
+
+
+@pytest.mark.asyncio
+async def test_reader_error_releases_ownership() -> None:
+    """A producer failure propagates without leaving an active reader behind."""
+    buf = AudioBuffer(TEST_PCM_FORMAT)
+    reader = buf.get_raw_stream()
+    buf._producer_error = AudioError("source failed")
+    with pytest.raises(AudioError, match="source failed"):
+        await anext(reader)
+    assert buf._active_readers == 0
+    await buf.clear()
+
+
+@pytest.mark.asyncio
+async def test_explicit_clear_cancels_active_reader() -> None:
+    """Reader ownership protects only inactivity cleanup, not explicit stop."""
+    buf = AudioBuffer(TEST_PCM_FORMAT)
+    buf.fill(_make_source(3))
+    reader = buf.get_raw_stream()
+    try:
+        await anext(reader)
+        assert buf._active_readers == 1
+        await buf.clear()
+        with pytest.raises(StopAsyncIteration):
+            await anext(reader)
+        assert buf._active_readers == 0
+        assert buf.size_seconds == 0
+    finally:
+        await reader.aclose()
+        await buf.clear()
+
+
+@pytest.mark.asyncio
+async def test_queue_item_stream_close_releases_reader(mass_minimal: MusicAssistant) -> None:
+    """Closing a partially consumed queue-item stream releases its real buffer reader."""
+    details = _make_stream_details(MediaType.SOUND_EFFECT, duration=3, allow_seek=True)
+    details.loudness = -10.0
+    item = QueueItem(
+        queue_id="player_a",
+        queue_item_id="current",
+        name="Current",
+        duration=3,
+        streamdetails=details,
+    )
+    buf = AudioBuffer(TEST_PCM_FORMAT)
+    buf.fill(_make_source(3))
+    details.buffer = buf
+    controller = StreamsAudio(mass_minimal)
+    stream = controller.get_queue_item_stream(item, TEST_PCM_FORMAT, prepared_buffer=buf)
+    try:
+        await anext(stream)
+        assert buf._active_readers == 1
+        await stream.aclose()
+        assert buf._active_readers == 0
+    finally:
+        await stream.aclose()
+        await buf.clear()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exit_mode", ["close", "cancel", "error"])
+async def test_smartfade_body_exit_releases_reader(
+    mass_minimal: MusicAssistant, inactivity_clock: _InactivityClock, exit_mode: str
+) -> None:
+    """The smartfade wrapper closes its retained child immediately on every body exit."""
+    details = _make_stream_details(MediaType.SOUND_EFFECT, duration=3, allow_seek=True)
+    details.loudness = -10.0
+    item = QueueItem(
+        queue_id="player_a",
+        queue_item_id="current",
+        name="Current",
+        duration=3,
+        streamdetails=details,
+    )
+    queue = SimpleNamespace(queue_id="player_a", display_name="Queue")
+    cast("Any", mass_minimal.player_queues).get = lambda _queue_id: queue
+    buf = AudioBuffer(TEST_PCM_FORMAT)
+    buf.fill(_make_source(3))
+    details.buffer = buf
+    controller = StreamsAudio(mass_minimal)
+    inner = controller.get_queue_item_stream(item, TEST_PCM_FORMAT, prepared_buffer=buf)
+    with patch.object(controller, "get_queue_item_stream", return_value=inner):
+        stream = controller.get_queue_item_stream_with_smartfade(
+            cast("Any", SimpleNamespace(player_id="player_a", name="Player")),
+            item,
+            TEST_PCM_FORMAT,
+        )
+        try:
+            await anext(stream)
+            assert buf._active_readers == 1
+            if exit_mode == "close":
+                await stream.aclose()
+            elif exit_mode == "cancel":
+                with pytest.raises(asyncio.CancelledError):
+                    await stream.athrow(asyncio.CancelledError())
+            else:
+                with pytest.raises(RuntimeError, match="consumer failed"):
+                    await stream.athrow(RuntimeError("consumer failed"))
+            assert buf._active_readers == 0
+            await inactivity_clock.advance(301)
+            assert buf._inactivity_task is not None
+            await asyncio.wait_for(buf._inactivity_task, timeout=1)
+            assert buf.cancelled
+        finally:
+            await stream.aclose()
+            await inner.aclose()
+            await buf.clear()
+
+
 # -- Pre-buffering of the next queue item --
 
 
@@ -1156,6 +1485,7 @@ async def mass_minimal(mass_minimal: MusicAssistant) -> MusicAssistant:
     """Extend the base fixture with the player_queues/streams stand-ins get_queue_item_stream needs."""
     mass_minimal.player_queues = SimpleNamespace(  # type: ignore[assignment]
         get_active_queue=lambda _queue_id: None,
+        get_next_item=lambda _queue_id, _item_id: None,
         prepare_next_audio_buffer=lambda _queue_id: None,
         queue_data_or_none=lambda _queue_id: None,
     )
@@ -1184,6 +1514,8 @@ async def _stream_until_prebuffer_window(
     next_item_media_type: MediaType,
     queue_id: str,
     is_realtime: bool = False,
+    player_next_is_current: bool = False,
+    player_next_media_type: MediaType | None = None,
 ) -> None:
     """
     Drive get_queue_item_stream for a 90s current TRACK item past the pre-buffer trigger point.
@@ -1206,11 +1538,26 @@ async def _stream_until_prebuffer_window(
         streamdetails=streamdetails,
     )
     next_item = SimpleNamespace(queue_item_id="next", media_type=next_item_media_type)
-    queue = SimpleNamespace(next_item=next_item)
+    player_next = (
+        current_item
+        if player_next_is_current
+        else SimpleNamespace(
+            queue_item_id="player_next", media_type=player_next_media_type or next_item_media_type
+        )
+    )
+    queue = SimpleNamespace(next_item=player_next)
     mass.player_queues.get_active_queue = lambda _player_id: queue  # type: ignore[method-assign, assignment, return-value]
 
+    def successor(request_queue_id: str, after_item_id: int | str) -> Any:
+        assert request_queue_id == queue_id
+        assert after_item_id == current_item.queue_item_id
+        return next_item
+
     controller = StreamsAudio(mass)
-    with patch.object(audio_mod, "AudioBuffer", _FakeAudioBuffer):
+    with (
+        patch.object(mass.player_queues, "get_next_item", side_effect=successor),
+        patch.object(audio_mod, "AudioBuffer", _FakeAudioBuffer),
+    ):
         async for _chunk in controller.get_queue_item_stream(current_item, TEST_PCM_FORMAT):
             pass
 
@@ -1268,7 +1615,39 @@ async def test_realtime_source_also_gets_the_fallback_prebuffer_trigger(
         is_realtime=True,
     )
 
-    assert calls == ["player_a"]
+    assert calls == ["player_a:current"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("player_next_is_current", "player_next_media_type", "next_item_media_type", "should_prepare"),
+    [
+        (True, MediaType.TRACK, MediaType.TRACK, True),
+        (False, MediaType.AUDIO_SOURCE, MediaType.TRACK, True),
+        (False, MediaType.TRACK, MediaType.AUDIO_SOURCE, False),
+    ],
+)
+async def test_prebuffer_uses_streamed_successor_not_player_next(
+    mass_minimal: MusicAssistant,
+    player_next_is_current: bool,
+    player_next_media_type: MediaType,
+    next_item_media_type: MediaType,
+    should_prepare: bool,
+) -> None:
+    """Ahead-of-playback streaming checks its own successor, including live exclusions."""
+    prepare = MagicMock()
+    mass_minimal.player_queues.prepare_next_audio_buffer = prepare  # type: ignore[method-assign]
+    await _stream_until_prebuffer_window(
+        mass_minimal,
+        queue_id="player_a",
+        next_item_media_type=next_item_media_type,
+        player_next_is_current=player_next_is_current,
+        player_next_media_type=player_next_media_type,
+    )
+    if should_prepare:
+        prepare.assert_called_once_with("player_a", after_item_id="current")
+    else:
+        prepare.assert_not_called()
 
 
 @pytest.mark.asyncio

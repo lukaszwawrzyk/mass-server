@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import MagicMock
 
+import pytest
 from music_assistant_models.enums import PlaybackState
 
 from music_assistant.controllers.player_queues.playback_tracker import PlaybackTrackerMixin
@@ -78,3 +79,23 @@ def test_flow_progress_keeps_unfinished_tail_as_active_entry() -> None:
 
     assert index == 0
     assert elapsed == 25.0
+
+
+@pytest.mark.parametrize("total_elapsed", [149.0, 150.0, 150.001, 151.0, 175.0])
+@pytest.mark.parametrize(("seek_position", "playback_speed"), [(0, 1.0), (30, 1.5)])
+def test_flow_progress_past_buffer_keeps_last_item_position(
+    total_elapsed: float, seek_position: int, playback_speed: float
+) -> None:
+    """The last item's media position stays continuous when playback passes its logged end."""
+    items = [_queue_item("track-1", 100.0), _queue_item("track-2", 50.0)]
+    items[1].streamdetails.seek_position = seek_position
+    items[1].extra_attributes["playback_speed"] = playback_speed
+    log = [
+        SimpleNamespace(queue_item_id="track-1", seconds_streamed=100.0),
+        SimpleNamespace(queue_item_id="track-2", seconds_streamed=50.0),
+    ]
+
+    index, elapsed = _flow_progress(total_elapsed, log, items)
+
+    assert index == 1
+    assert elapsed == pytest.approx(seek_position + (total_elapsed - 100.0) * playback_speed)
