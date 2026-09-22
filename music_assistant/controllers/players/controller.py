@@ -662,6 +662,12 @@ class PlayerController(AnnouncementsMixin, AudioSourceMixin, ProtocolLinkingMixi
         player = self._get_player_with_redirect(player_id)
         async with self.get_player_lock(player.player_id, PlayerLockPurpose.PLAYBACK):
             if player.state.playback_state == PlaybackState.PLAYING:
+                # The output is already playing. If a pause hold already observed the
+                # paused state, this is a resume that beat the player report; leave a
+                # hold that has not seen pause alone so a stale PLAYING report cannot
+                # release it.
+                if active_queue := self.get_active_queue(player):
+                    self.mass.player_queues.release_confirmed_pause_hold(active_queue.queue_id)
                 self.logger.info(
                     "Ignore PLAY request to player %s: player is already playing",
                     player.state.name,
@@ -4768,6 +4774,10 @@ class PlayerController(AnnouncementsMixin, AudioSourceMixin, ProtocolLinkingMixi
                 return
         # handle unpause (=play if player is paused)
         if player.state.playback_state == PlaybackState.PAUSED:
+            # queue.pause() holds player reports until resume. This path unpauses the
+            # output without going through queue.play(), which is what releases the hold.
+            if active_queue := self.get_active_queue(player):
+                self.mass.player_queues.release_pause_update_hold(active_queue.queue_id)
             active_source = next(
                 (x for x in player.state.source_list if x.id == player.state.active_source), None
             )

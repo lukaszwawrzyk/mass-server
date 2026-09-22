@@ -66,6 +66,10 @@ class PlayerQueueData:
     # runtime-only fields below; not persisted, reset to these defaults on restart
     prev_state: CompareState | None = None
     transitioning: bool = False
+    # Pause ignores player reports until the output has actually gone paused and
+    # come back to playing. A stale PLAYING report must not release the hold.
+    pause_update_hold: bool = False
+    pause_confirmed: bool = False
     play_action_refcount: int = 0
     last_counted_play: str | None = None
     # session_id whose flow stream was fully generated

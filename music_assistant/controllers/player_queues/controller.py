@@ -723,7 +723,12 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
         if queue.active and queue.state == PlaybackState.PLAYING:
             queue.resume_pos = int(queue.corrected_elapsed_time)
         # Ignore stale PLAYING updates (notably from Cast) until playback resumes.
+        # players/cmd/play unpauses the output directly and does not pass through
+        # queue.play(), so the hold is released from player reports, not only there.
         self._set_transitioning(queue_id, True)
+        if queue_data := self._queue_data.get(queue_id):
+            queue_data.pause_update_hold = True
+            queue_data.pause_confirmed = False
         queue.state = PlaybackState.PAUSED
         # Use internal handler to avoid circular redirect
         # (cmd_pause redirects to queue.pause, which calls cmd_pause again)
@@ -1272,9 +1277,12 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
             queue.state = PlaybackState.IDLE
             # return early if the queue is not active and we have no previous state
             return
-        if self._queue_data[queue_id].transitioning:
-            # we're currently transitioning to a new track,
-            # ignore updates from the player during this time
+        if self._queue_data[queue_id].transitioning and not self._resume_confirmed(
+            queue_id, player
+        ):
+            # A track change ignores player reports until it finishes. A pause hold
+            # ignores them until the output has paused and is playing again; a stale
+            # PLAYING report must not resume queue index updates.
             return
         # queue is active and preflight checks passed, update the queue details
         self._update_queue_from_player(player)
@@ -1903,10 +1911,42 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
         # player is not paused, perform resume instead
         await self.resume(queue_id)
 
+    def release_pause_update_hold(self, queue_id: str) -> None:
+        """Resume queue updates after a pause, once the output is actually paused or playing again."""
+        queue_data = self._queue_data.get(queue_id)
+        if queue_data is None or not queue_data.pause_update_hold:
+            return
+        self._set_transitioning(queue_id, False)
+
+    def release_confirmed_pause_hold(self, queue_id: str) -> None:
+        """Release a pause hold only after a paused report was observed."""
+        queue_data = self._queue_data.get(queue_id)
+        if queue_data is None or not queue_data.pause_confirmed:
+            return
+        self.release_pause_update_hold(queue_id)
+
+    def _resume_confirmed(self, queue_id: str, player: Player) -> bool:
+        """Return whether this report ends a pause hold and queue updates should resume."""
+        queue_data = self._queue_data[queue_id]
+        if not queue_data.pause_update_hold:
+            return False
+        state = player.state.playback_state
+        if state == PlaybackState.PAUSED:
+            queue_data.pause_confirmed = True
+            return False
+        if state == PlaybackState.PLAYING and queue_data.pause_confirmed:
+            self._set_transitioning(queue_id, False)
+            return True
+        return False
+
     def _set_transitioning(self, queue_id: str, value: bool) -> None:
         """Mark (or clear) whether a queue is mid-transition (no-op if it is not registered)."""
         if (queue_data := self._queue_data.get(queue_id)) is not None:
             queue_data.transitioning = value
+            # A track load and an explicit clear both supersede a pause hold.
+            # pause() sets the hold again immediately after marking the transition.
+            queue_data.pause_update_hold = False
+            queue_data.pause_confirmed = False
 
     def _clear(self, queue_id: str, skip_stop: bool = False) -> None:
         """Drop the queue's items and playback position, leaving user settings untouched."""
