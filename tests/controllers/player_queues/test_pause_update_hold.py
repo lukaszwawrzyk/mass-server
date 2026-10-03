@@ -6,6 +6,7 @@ from typing import Any
 from unittest.mock import AsyncMock, Mock
 
 from music_assistant_models.enums import PlaybackState, PlayerType
+from music_assistant_models.player import PlayerMedia
 from music_assistant_models.player_queue import PlayerQueue
 
 from music_assistant.controllers.player_queues import PlayerQueuesController
@@ -14,7 +15,7 @@ from music_assistant.controllers.player_queues.state import PlayerQueueData
 
 def _controller() -> Any:
     """Build a queue controller with one active playing queue."""
-    ctrl = PlayerQueuesController.__new__(PlayerQueuesController)
+    ctrl: Any = PlayerQueuesController.__new__(PlayerQueuesController)
     ctrl.logger = Mock()
     ctrl.mass = Mock()
     ctrl.mass.cancel_timer = Mock()
@@ -41,6 +42,11 @@ def _player(state: PlaybackState) -> Mock:
     player.type = PlayerType.PLAYER
     player.player_id = "q1"
     player.extra_data = {}
+    player.active_output_protocol = None
+    player.resolve_output_player.return_value = player
+    player.current_media = PlayerMedia(
+        uri="http://ma/flow/session/q1/item/player.flac", source_id="q1", queue_item_id="item"
+    )
     player.state.playback_state = state
     player.state.active_source = "q1"
     return player

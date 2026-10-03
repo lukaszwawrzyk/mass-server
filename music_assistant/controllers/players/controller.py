@@ -107,6 +107,7 @@ from music_assistant.controllers.webserver.helpers.auth_middleware import (
 from music_assistant.helpers.api import api_command
 from music_assistant.helpers.colors import get_palette_for_url
 from music_assistant.helpers.config_entries import PLAYBACK_TARGET_TYPES
+from music_assistant.helpers.player import is_external_announcement
 from music_assistant.helpers.plugin_engines import create_tts_engine_config_entries
 from music_assistant.helpers.util import (
     TaskManager,
@@ -661,6 +662,24 @@ class PlayerController(AnnouncementsMixin, AudioSourceMixin, ProtocolLinkingMixi
         """
         player = self._get_player_with_redirect(player_id)
         async with self.get_player_lock(player.player_id, PlayerLockPurpose.PLAYBACK):
+            active_queue = self.get_active_queue(player)
+            if (
+                active_queue
+                and active_queue.active
+                and (
+                    is_external_announcement(player)
+                    or self.mass.player_queues.has_external_announcement_hold(active_queue.queue_id)
+                    is True
+                    or (
+                        active_queue.state == PlaybackState.PAUSED
+                        and player.state.playback_state != PlaybackState.PAUSED
+                    )
+                )
+            ):
+                # HA replaced the output outside MA. PLAY must restart the retained
+                # queue, not unpause speech or ignore its stale PLAYING report.
+                await self.mass.player_queues.resume(active_queue.queue_id)
+                return
             if player.state.playback_state == PlaybackState.PLAYING:
                 # The output is already playing. If a pause hold already observed the
                 # paused state, this is a resume that beat the player report; leave a
@@ -4761,6 +4780,22 @@ class PlayerController(AnnouncementsMixin, AudioSourceMixin, ProtocolLinkingMixi
         """
         player = self.get_player(player_id, raise_unavailable=True)
         assert player is not None
+        active_queue = self.get_active_queue(player)
+        if (
+            active_queue
+            and active_queue.active
+            and (
+                is_external_announcement(player)
+                or self.mass.player_queues.has_external_announcement_hold(active_queue.queue_id)
+                is True
+                or (
+                    active_queue.state == PlaybackState.PAUSED
+                    and player.state.playback_state != PlaybackState.PAUSED
+                )
+            )
+        ):
+            await self.mass.player_queues.resume(active_queue.queue_id)
+            return
         if player.state.playback_state == PlaybackState.PLAYING:
             self.logger.info(
                 "Ignore PLAY request to player %s: player is already playing", player.state.name

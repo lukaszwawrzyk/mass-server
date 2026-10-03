@@ -17,6 +17,7 @@ import asyncio
 import random
 import time
 from typing import TYPE_CHECKING, Any, Final, cast
+from urllib.parse import urlsplit
 
 import shortuuid
 from music_assistant_models.auth import Scope
@@ -87,6 +88,7 @@ from music_assistant.controllers.player_queues.stream_feeder import StreamFeeder
 from music_assistant.controllers.webserver.helpers.auth_middleware import get_current_user
 from music_assistant.helpers.api import api_command
 from music_assistant.helpers.config_entries import PLAYBACK_TARGET_TYPES
+from music_assistant.helpers.player import is_external_announcement
 from music_assistant.helpers.uri import parse_uri
 from music_assistant.models.music_provider import ProviderStreamLimitError
 from music_assistant.models.player import Player, PlayerMedia
@@ -729,6 +731,8 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
         if queue_data := self._queue_data.get(queue_id):
             queue_data.pause_update_hold = True
             queue_data.pause_confirmed = False
+            if queue_data.interrupted_flow_session_id is not None:
+                queue_data.interrupted_flow_session_id = queue_data.session_id or ""
         queue.state = PlaybackState.PAUSED
         # Use internal handler to avoid circular redirect
         # (cmd_pause redirects to queue.pause, which calls cmd_pause again)
@@ -902,7 +906,10 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
         queue = self._queue_data[queue_id].queue
         queue_items = self._queue_data[queue_id].items
         resume_item = queue.current_item
-        if queue.state == PlaybackState.PLAYING:
+        if (
+            queue.state == PlaybackState.PLAYING
+            and self._queue_data[queue_id].interrupted_flow_session_id is None
+        ):
             # resume requested while already playing,
             # use current position as resume position
             resume_pos = queue.corrected_elapsed_time
@@ -1269,13 +1276,17 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
             # race condition
             return
         if player.extra_data.get(ATTR_ANNOUNCEMENT_IN_PROGRESS):
-            # do nothing while the announcement is in progress
+            return
+        if is_external_announcement(player):
+            self._hold_external_announcement(queue_id)
             return
         # determine if this queue is currently active for this player
         queue.active = player.state.active_source in (queue.queue_id, None)
         if not queue.active and self._queue_data[queue_id].prev_state is None:
             queue.state = PlaybackState.IDLE
             # return early if the queue is not active and we have no previous state
+            return
+        if queue.active and self._is_stale_flow_report(queue_id, player):
             return
         if self._queue_data[queue_id].transitioning and not self._resume_confirmed(
             queue_id, player
@@ -1294,7 +1305,16 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
         queue_id = player.player_id
         if (queue := self.get(queue_id)) is None:
             return
-        if not queue.active:
+        if player.extra_data.get(ATTR_ANNOUNCEMENT_IN_PROGRESS):
+            return
+        if is_external_announcement(player):
+            self._hold_external_announcement(queue_id)
+            return
+        if (
+            not queue.active
+            or self._queue_data[queue_id].transitioning
+            or self._is_stale_flow_report(queue_id, player)
+        ):
             return
         player_elapsed = player.state.corrected_elapsed_time
         if player_elapsed is None:
@@ -1798,6 +1818,28 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
             queue.queue_id, {item.uri for item in items if item.uri is not None}
         )
 
+    def has_external_announcement_hold(self, queue_id: str) -> bool:
+        """Return whether external speech interrupted the retained queue stream."""
+        queue_data = self._queue_data.get(queue_id)
+        return queue_data is not None and (
+            queue_data.external_announcement_hold
+            or queue_data.interrupted_flow_session_id is not None
+        )
+
+    def release_pause_update_hold(self, queue_id: str) -> None:
+        """Resume queue updates after a pause, once the output is actually paused or playing again."""
+        queue_data = self._queue_data.get(queue_id)
+        if queue_data is None or not queue_data.pause_update_hold:
+            return
+        self._set_transitioning(queue_id, False)
+
+    def release_confirmed_pause_hold(self, queue_id: str) -> None:
+        """Release a pause hold only after a paused report was observed."""
+        queue_data = self._queue_data.get(queue_id)
+        if queue_data is None or not queue_data.pause_confirmed:
+            return
+        self.release_pause_update_hold(queue_id)
+
     async def _save_queue_to_cache(self, queue_id: str) -> None:
         """Persist the queue's state (and its items when changed) to the cache."""
         if (queue_data := self._queue_data.get(queue_id)) is None:
@@ -1896,7 +1938,14 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
         queue_player = self.mass.players.get_player(queue_id, True)
         if queue_player is None:
             raise PlayerUnavailableError(f"Player {queue_id} is not available")
-        if (queue := self.get(queue_id)) and queue.active and queue.state == PlaybackState.PAUSED:
+        if (
+            (queue := self.get(queue_id))
+            and queue.active
+            and queue.state == PlaybackState.PAUSED
+            and queue_player.state.playback_state == PlaybackState.PAUSED
+            and not is_external_announcement(queue_player)
+            and not self.has_external_announcement_hold(queue_id)
+        ):
             self._set_transitioning(queue_id, False)
             # forward the actual play/unpause command to the player,
             # holding the action until the player confirms it resumed playback
@@ -1911,30 +1960,75 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
         # player is not paused, perform resume instead
         await self.resume(queue_id)
 
-    def release_pause_update_hold(self, queue_id: str) -> None:
-        """Resume queue updates after a pause, once the output is actually paused or playing again."""
-        queue_data = self._queue_data.get(queue_id)
-        if queue_data is None or not queue_data.pause_update_hold:
+    def _hold_external_announcement(self, queue_id: str) -> None:
+        """Keep retained music paused while external speech owns its physical output."""
+        queue_data = self._queue_data[queue_id]
+        queue = queue_data.queue
+        if not queue.active or queue.state not in (PlaybackState.PLAYING, PlaybackState.PAUSED):
             return
-        self._set_transitioning(queue_id, False)
+        if queue_data.transitioning and not queue_data.pause_update_hold:
+            # Do not turn an actual track-load transition into a releasable pause hold.
+            return
+        if (
+            queue_data.interrupted_flow_session_id is not None
+            and queue_data.session_id != queue_data.interrupted_flow_session_id
+        ):
+            # Resume already started a replacement stream. An old speech report must
+            # not pause its producer; session reconciliation still rejects its timing.
+            return
+        # A delayed old music PLAYING report may have released the original pause
+        # hold just before HA loads speech. Freeze the clock again without changing
+        # the saved item/resume_pos; speech's later IDLE or missing-metadata reports
+        # must not rewrite them either.
+        queue.state = PlaybackState.PAUSED
+        if queue.flow_mode and queue_data.interrupted_flow_session_id is None:
+            queue_data.interrupted_flow_session_id = queue_data.session_id or ""
+        self._set_transitioning(queue_id, True)
+        queue_data.pause_update_hold = True
+        queue_data.pause_confirmed = True
+        queue_data.external_announcement_hold = True
 
-    def release_confirmed_pause_hold(self, queue_id: str) -> None:
-        """Release a pause hold only after a paused report was observed."""
-        queue_data = self._queue_data.get(queue_id)
-        if queue_data is None or not queue_data.pause_confirmed:
-            return
-        self.release_pause_update_hold(queue_id)
+    def _is_stale_flow_report(self, queue_id: str, player: Player) -> bool:
+        """Return whether the raw output still describes an older flow stream session."""
+        queue_data = self._queue_data[queue_id]
+        if not queue_data.queue.flow_mode or not queue_data.session_id:
+            return False
+        recovering = queue_data.interrupted_flow_session_id is not None
+        media = player.resolve_output_player().current_media
+        if media is None or not isinstance(media.uri, str):
+            return recovering
+        parts = urlsplit(media.uri).path.strip("/").split("/")
+        if len(parts) < 4 or parts[0] != "flow" or parts[2] != queue_id:
+            return recovering
+        if parts[1] != queue_data.session_id:
+            return True
+        if recovering:
+            if (
+                queue_data.session_id == queue_data.interrupted_flow_session_id
+                or player.state.playback_state != PlaybackState.PLAYING
+            ):
+                return True
+            # Resume issued a new stream, and its real renderer now confirms it.
+            # Until this point, even a missing URI can still mean the old speech.
+            queue_data.interrupted_flow_session_id = None
+            if queue_data.pause_update_hold:
+                self._set_transitioning(queue_id, False)
+        return False
 
     def _resume_confirmed(self, queue_id: str, player: Player) -> bool:
         """Return whether this report ends a pause hold and queue updates should resume."""
         queue_data = self._queue_data[queue_id]
-        if not queue_data.pause_update_hold:
+        if not queue_data.pause_update_hold or queue_data.external_announcement_hold:
             return False
         state = player.state.playback_state
         if state == PlaybackState.PAUSED:
             queue_data.pause_confirmed = True
             return False
-        if state == PlaybackState.PLAYING and queue_data.pause_confirmed:
+        if (
+            state == PlaybackState.PLAYING
+            and queue_data.pause_confirmed
+            and self._parse_player_current_item_id(queue_id, player) is not None
+        ):
             self._set_transitioning(queue_id, False)
             return True
         return False
@@ -1947,6 +2041,7 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
             # pause() sets the hold again immediately after marking the transition.
             queue_data.pause_update_hold = False
             queue_data.pause_confirmed = False
+            queue_data.external_announcement_hold = False
 
     def _clear(self, queue_id: str, skip_stop: bool = False) -> None:
         """Drop the queue's items and playback position, leaving user settings untouched."""

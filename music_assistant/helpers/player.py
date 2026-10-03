@@ -1,6 +1,16 @@
 """Helpers for player behavior."""
 
-from music_assistant_models.enums import PlayerType
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+from urllib.parse import urlsplit
+
+from music_assistant_models.enums import MediaType, PlayerType
+
+from music_assistant.constants import ATTR_ANNOUNCEMENT_IN_PROGRESS
+
+if TYPE_CHECKING:
+    from music_assistant.models.player import Player
 
 _DEFAULT_ICONS_BY_PROVIDER = {
     "airplay": "airplay",
@@ -41,6 +51,25 @@ _DEFAULT_ICON_MATCHES = (
     ("radio", ("radio",)),
     ("car", ("carplay",)),
 )
+
+
+def is_external_announcement(player: Player) -> bool:
+    """Return whether the output has announcement audio loaded outside the MA queue."""
+    # Final current_media can be synthesized from the retained MA queue even when
+    # HA replaced the physical output with speech. Inspect the raw renderer instead.
+    output = player.resolve_output_player()
+    if player.extra_data.get(ATTR_ANNOUNCEMENT_IN_PROGRESS) or output.extra_data.get(
+        ATTR_ANNOUNCEMENT_IN_PROGRESS
+    ):
+        return False
+    media = output.current_media
+    if media is None:
+        return False
+    if media.media_type == MediaType.ANNOUNCEMENT:
+        return True
+    # Cast reports HA TTS as an ordinary track in its default Media Receiver.
+    # Match the HA resource path, not the host, signature or audio file extension.
+    return isinstance(media.uri, str) and urlsplit(media.uri).path.startswith("/api/tts_proxy/")
 
 
 def get_default_player_icon(

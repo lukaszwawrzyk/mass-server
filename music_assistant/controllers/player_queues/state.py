@@ -70,6 +70,12 @@ class PlayerQueueData:
     # come back to playing. A stale PLAYING report must not release the hold.
     pause_update_hold: bool = False
     pause_confirmed: bool = False
+    # Speech replaced the retained stream. Only an explicit queue command may
+    # resume it; delayed reports for the old stream are not a confirmation.
+    external_announcement_hold: bool = False
+    # Keep the interrupted flow identity until the replacement stream is confirmed,
+    # including the gap after a resume command when speech metadata may be cleared.
+    interrupted_flow_session_id: str | None = None
     play_action_refcount: int = 0
     last_counted_play: str | None = None
     # session_id whose flow stream was fully generated
